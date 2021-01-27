@@ -1,5 +1,6 @@
 const { Command } = require("discord.js-commando")
-const { getRequestee, getVoiceChannel, getOrCreateMusic } = require("../../classes/Helpers")
+const { getRequestee, getVoiceChannel } = require("../../helpers")
+const { resume } = require("./resume")
 
 const commandConfig = {
   name: "play",
@@ -12,6 +13,7 @@ const commandConfig = {
       key: "input",
       prompt: "Search for a song or paste some link(s) to play.",
       type: "string",
+      default: "",
     },
   ],
   guildOnly: true,
@@ -23,18 +25,33 @@ module.exports = class PlayCommand extends Command {
   }
 
   async run (msg, args) {
-    run(msg, args)
+    await run(msg, args, false)
   }
 }
 
-const run = (msg, args, index) => {
-  const music = getOrCreateMusic(msg)
-  const success = music.add(args.input, getRequestee(msg), getVoiceChannel(msg), index)
-  if (success) {
-    msg.react("▶️")
+const run = async (msg, args, jump) => {
+  const music = msg.guild.music
+
+  if (music.state.pauser !== "" && args.input === "") {
+    resume(msg)
+    return
+  }
+
+  const searchReaction = msg.react("🔍")
+
+  if (args.input !== "") {
+    const success = await music.add(args.input, getRequestee(msg), getVoiceChannel(msg), jump, msg.channel)
+    searchReaction.then(r => r.remove())
+    await (await searchReaction).remove()
+    if (success) {
+      msg.react("▶️")
+    }
+    else {
+      msg.reply(`❌ Sorry, I couldn't find a YouTube video for \`${args.input}\`, please try again...`)
+    }
   }
   else {
-    msg.reply(`Sorry, I couldn't find a YouTube video for ${args.input}, please try again...`)
+    msg.reply("Please provide a link or search term for the song you wish to play")
   }
 }
 

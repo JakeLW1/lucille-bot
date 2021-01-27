@@ -4,6 +4,8 @@ module.exports = class Track {
     this.title = title || ""
     this.thumbnail = thumbnail || ""
     this.finished = false
+    this.startTime = 0
+    this.listenTime = 0
   }
 
   setArtists (artists) {
@@ -37,12 +39,17 @@ module.exports = class Track {
   }
 
   setQuery (query) {
-    this.query = encodeURIComponent(query)
+    this.query = query
     return this
   }
 
   setYouTubeTitle (youTubeTitle) {
     this.youTubeTitle = youTubeTitle
+    return this
+  }
+
+  setYouTubeLink (youTubeLink) {
+    this.youTubeLink = youTubeLink
     return this
   }
 
@@ -76,8 +83,33 @@ module.exports = class Track {
     return this
   }
 
-  setSpotifyUri(spotifyUri) {
+  setSpotifyUri (spotifyUri) {
     this.spotifyUri = spotifyUri
+    return this
+  }
+
+  setRadioInstance (radioInstance) {
+    this.radioInstance = radioInstance
+    return this
+  }
+
+  setRadioMusicToX (radioMusicToX) {
+    this.radioMusicToX = radioMusicToX
+    return this
+  }
+
+  setYouTubeId (youTubeId) {
+    this.youTubeId = youTubeId
+    return this
+  }
+
+  setTracked (tracked) {
+    this.tracked = tracked
+    return this
+  }
+
+  setListenTime (listenTime) {
+    this.listenTime = listenTime
     return this
   }
 
@@ -90,6 +122,7 @@ module.exports = class Track {
     this.platform = track.platform
     this.query = track.query
     this.youTubeTitle = track.youTubeTitle
+    this.youTubeLink = track.youTubeLink
     this.duration = track.duration
     this.requestStream = track.requestStream
     this.radio = track.radio
@@ -97,6 +130,11 @@ module.exports = class Track {
     this.radioMetadata = track.radioMetadata
     this.finished = track.finished
     this.spotifyUri = track.spotifyUri
+    this.radioInstance = track.radioInstance
+    this.radioMusicToX = track.radioMusicToX
+    this.youTubeId = track.youTubeId
+    this.tracked = track.tracked
+    this.listenTime = track.listenTime
     return this
   }
 }

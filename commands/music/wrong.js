@@ -1,8 +1,7 @@
 const { Command } = require("discord.js-commando")
-const scrapeYt = require("scrape-yt")
+const { searchYouTube } = require("../../worker/bindings")
 const Track = require("../../classes/Track")
-const { getOrCreateMusic } = require("../../classes/Helpers")
-const { msToTimestamp } = require("../../helpers")
+const { msToTimestamp, escapeMarkdown } = require("../../helpers")
 
 module.exports = class extends Command {
   constructor (client) {
@@ -25,18 +24,18 @@ module.exports = class extends Command {
   }
 
   async run (msg, args) {
-    const music = getOrCreateMusic(msg)
+    const music = msg.guild.music
     const queueIndex = args.index === -1 ? 0 : args.index
     const queueItem = music.state.queue[queueIndex]
     // We can only 'correct' a item in the queue that has been searched on YT
     if (queueItem && queueItem.link) {
       const query = queueItem.query
       if (query) {
-        const searchResults = (await scrapeYt.search(query)).filter(res => res.type === "video").slice(0, 5)
+        const searchResults = (await searchYouTube(query)).slice(0, 5)
         if (searchResults) {
           msg.react("🔍")
 
-          await msg.reply("Respond with the number you'd like to replace.\nRespond with `cancel` to cancel the command. The command will automatically be cancelled in 30 seconds.\n\n" + searchResults.map((r, i) => `\`${i + 1}\` ${r.title} \`${msToTimestamp(r.duration * 1000)}\``).join("\n"))
+          await msg.reply("Respond with the number you'd like to replace.\nRespond with `cancel` to cancel the command. The command will automatically be cancelled in 30 seconds.\n\n" + searchResults.map((r, i) => `\`${i + 1}\` ${escapeMarkdown(r.title)} \`${msToTimestamp(r.duration * 1000)}\``).join("\n"))
 
           const filter = (message) => (/^[1-5]$/.test(message.content) || message.content === "cancel") && message.author.id === msg.author.id
           const collected = await msg.channel.awaitMessages(filter, { time: 30000, max: 1 })
@@ -55,10 +54,12 @@ module.exports = class extends Command {
 
             if (queueIndex === 0) {
               music.state.queue.splice(queueIndex + 1, 0, track)
+              music.setState({ queue: music.state.queue })
               music.dispatcherExec(d => d.end())
             }
             else {
               music.state.queue.splice(queueIndex, 1, track)
+              music.setState({ queue: music.state.queue })
               music.updateEmbed()
             }
           }

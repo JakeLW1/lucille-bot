@@ -1,5 +1,4 @@
 const { Command } = require("discord.js-commando")
-const { getOrCreateMusic } = require("../../classes/Helpers")
 
 module.exports = class extends Command {
   constructor (client) {
@@ -32,7 +31,7 @@ module.exports = class extends Command {
   }
 
   async run (msg, args) {
-    const music = getOrCreateMusic(msg)
+    const music = msg.guild.music
     let range = [1, 1]
     const match = args.range.match(/^(\d+)\W(\d+)$/)
     if (match) {
@@ -43,6 +42,7 @@ module.exports = class extends Command {
     }
 
     music.state.queue.splice(range[0], (range[1] - range[0]) + 1)
+    music.setState({ queue: music.state.queue })
     music.updateEmbed()
 
     msg.react("❌")

@@ -1,41 +1,32 @@
-const scrapeYt = require("scrape-yt")
-const ytdl = require("ytdl-core")
 const { Util } = require("discord.js")
-const index = require("../index")
 const config = require("../config.json")
 const TopMostMessagePump = require("./TopMostMessagePump")
-const { safeJoin, msToTimestamp, selectRandom } = require("../helpers")
+const { safeJoin, msToTimestamp, selectRandom, escapeMarkdown } = require("../helpers")
 const TrackExtractor = require("./TrackExtractor")
 const { PLATFORM_YOUTUBE, PLATFORM_RADIO, PLATFORM_SPOTIFY, PLATFORM_TIDAL, PLATFORM_APPLE } = require("./TrackExtractor")
 const Track = require("./Track")
 const fs = require("fs")
 const { RadioMetadata } = require("./RadioMetadata")
-const radios = require("../radios.json")
-const Axios = require("axios")
+const axios = require("axios")
 const MusicToX = require("./MusicToX")
 const debounce = require("lodash.debounce")
 const RadioAdBlock = require("./RadioAdBlock")
-const { opus: Opus, FFmpeg } = require("prism-media")
-const { PassThrough } = require("stream")
-const { chooseFormat } = require("ytdl-core")
+const { searchYouTube } = require("../worker/bindings")
+const { getStream, getFfmpegStream } = require("./YouTubeToStream")
+const MusicState = require("./MusicState")
 
 const PLATFORMS_REQUIRE_YT_SEARCH = [PLATFORM_SPOTIFY, PLATFORM_TIDAL, PLATFORM_APPLE, PLATFORM_YOUTUBE, "search"]
 
-module.exports = class {
-  constructor (textChannel) {
-    this.state = {
+module.exports = class Music extends MusicState {
+  constructor (guild) {
+    super(guild, {
       joinState: 0,
       voiceChannel: null,
-      textChannel: textChannel,
+      textChannel: guild.systemChannel,
       voiceConnection: null,
       queue: [],
-      emojis: index.emojis.reduce((acc, cur) => {
-        acc[cur.name] = (textChannel.guild.emojis.cache.find(e => e.name === cur.name) || "").toString()
-        return acc
-      }, {}),
       pauser: "",
-      messagePump: new TopMostMessagePump(textChannel),
-      playTime: 0,
+      messagePump: new TopMostMessagePump().on("create", msg => this.setState({ embedId: msg.id })),
       bassBoost: 0,
       tempo: 1,
       volume: 100,
@@ -44,7 +35,14 @@ module.exports = class {
       repeat: "off",
       radioAdBlock: new RadioAdBlock(),
       summoned: false,
-    }
+      embedId: "",
+    })
+
+    this.guild = guild
+    this.client = guild.client
+
+    this.listenTimeHandle = null
+    this.streamTimeCache = 0
 
     // Move the embed down every 5 minutes, it can get lost when a radio is left on for ages
     this.debouncer = debounce(this.updateEmbed, 5 * 60 * 1000)
@@ -52,49 +50,78 @@ module.exports = class {
     this.state.radioAdBlock.on("volume", volume => {
       this.setVolume(volume, true)
     })
+
+    guild.client.once("ready", async () => {
+      // If an embed exists from the previous instance, delete it
+      if (this.state.embedId && this.state.textChannel) {
+        try {
+          const msg = await this.state.textChannel.messages.fetch(this.state.embedId)
+          if (msg) {
+            msg.delete()
+          }
+        }
+        catch (err) {
+          console.log(err.message)
+        }
+      }
+
+      // Useful for testing, boots the bot out of the channel on start up
+      if (guild.voice) {
+        await guild.voice.setChannel(null)
+      }
+
+      if (this.state.summoned && this.state.voiceChannel) {
+        await this.summon(this.state.voiceChannel)
+
+        if (this.state.joinState === 2) {
+          await this.play()
+        }
+      }
+    })
   }
 
-  async summon (voiceChannel, userSummoned = false) {
-    if (userSummoned) {
-      this.state.summoned = true
-    }
+  async summon (voiceChannel) {
+    this.setState({ summoned: true })
 
     // Join the voice channel if not already joining/joined
     if (this.state.joinState === 0) {
-      this.state.joinState = 1
+      this.setState({ joinState: 1 })
 
       try {
         const connection = await voiceChannel.join()
-        connection.play("./assets/sounds/silence.mp3")
 
-        this.state.joinState = 2
-        this.state.voiceChannel = voiceChannel
-        this.state.voiceConnection = connection
-        this.state.playCount = 0
+        this.setState({
+          joinState: 2,
+          voiceChannel: voiceChannel,
+          voiceConnection: connection,
+          playCount: 0,
+        })
 
-        this.state.voiceConnection.on("disconnect", () => {
-          this.state.queue.splice(0, this.state.queue.length)
-          this.state.summoned = false
+        this.state.voiceConnection.once("disconnect", () => {
+          this.setState({
+            queue: this.state.queue.splice(0, this.state.queue.length),
+            summoned: false,
+            voiceConnection: null,
+            voiceChannel: null,
+            joinState: 0,
+          })
           this.cleanUp()
         })
       }
       catch (err) {
-        this.state.joinState = 0
-        console.log(err)
+        this.setState({ joinState: 0 })
+        console.log(err.message)
       }
     }
     else if (this.state.joinState === 2) {
       if (this.state.voiceConnection && this.state.voiceConnection.voice) {
         await this.state.voiceConnection.voice.setChannel(voiceChannel)
-        this.state.voiceChannel = voiceChannel
+        this.setState({ voiceChannel })
       }
     }
   }
 
-  async add (input, requestee, voiceChannel, index = -1) {
-    const isPlaying = !!this.state.queue.length
-
-    let insertAt = index < 0 ? this.state.queue.length : index
+  async add (input, requestee, voiceChannel, jump, textChannel) {
     let tracks = []
 
     if (typeof input === "string") {
@@ -111,18 +138,8 @@ module.exports = class {
           .setPlatform("search")
           .setQuery(input)
 
-        const searchResults = (await scrapeYt.search(track.query)).filter(res => res.type === "video")
-        const searchResult = searchResults[0]
-
-        // console.log(`Search YouTube for ${track.query}\nTrack object: ${JSON.stringify(track)}\nSearch object: ${JSON.stringify(searchResults)}`)
-
+        const searchResult = await this.search(track)
         if (searchResult) {
-          track
-            .setYouTubeTitle(searchResult.title)
-            .setThumbnail(searchResult.thumbnail)
-            .setLink(`https://www.youtube.com/watch?v=${searchResult.id}`)
-            .setDuration(searchResult.duration)
-
           tracks = [track]
         }
         else {
@@ -135,26 +152,28 @@ module.exports = class {
     }
 
     if (!tracks.length) {
-      return
+      return false
     }
 
-    // If we're adding an item to the end of the queue & there's something in the queue already
-    if (index < 0 && this.state.queue.length > 1) {
-      const isAddingRadio = !!tracks.find(t => t.platform === PLATFORM_RADIO)
-      const radioIndex = this.state.queue.findIndex((t, idx) => idx > 0 && t.platform === PLATFORM_RADIO)
-      // If there's a radio in the queue
-      if (radioIndex >= 0) {
-        // And we're adding a radio, delete the old radio
-        if (isAddingRadio) {
-          this.state.queue.splice(radioIndex, 1)
-        }
-
-        // Update the insert index, to put it where the old radio was
-        insertAt = radioIndex
-      }
+    if (!this.state.queue.length) {
+      this.state.messagePump.setChannel(textChannel)
     }
 
-    this.state.queue.splice(insertAt, 0, ...tracks)
+    const wasRadio = this.state.queue[0] && this.state.queue[0].platform === PLATFORM_RADIO
+    const queueTracks = this.state.queue.filter(t => t.platform !== PLATFORM_RADIO)
+    const queueRadios = this.state.queue.filter(t => t.platform === PLATFORM_RADIO)
+    const newTracks = tracks.filter(t => t.platform !== PLATFORM_RADIO)
+    const newRadios = tracks.filter(t => t.platform === PLATFORM_RADIO)
+
+    // If the queue is empty, i.e. only a radio playing then happily handles inserting at 1 in an empty array.
+    queueTracks.splice(jump ? 1 : queueTracks.length, 0, ...newTracks)
+
+    const radios = newRadios.concat(queueRadios)
+    if (radios.length) {
+      queueTracks.push(radios[0])
+    }
+
+    this.setState({ queue: queueTracks })
 
     if (this.state.queue.length > 0) {
       // Join the voice channel if not already joining/joined
@@ -163,121 +182,81 @@ module.exports = class {
       }
 
       // If there's nothing playing, get the ball rolling
-      if (!isPlaying) {
-        this.searchAndPlay()
+      const notStreaming = this.guild.voice && this.guild.voice.connection && !this.guild.voice.connection.dispatcher
+      if (notStreaming || wasRadio) {
+        await this.searchAndPlay()
       }
       else {
-        // If there's a radio currently playing & there's something else in the queue (because we've just added it above)
-        if (this.state.queue[0].platform === PLATFORM_RADIO && this.state.queue.length > 1) {
-          // Then capture the radio
-          const [radio] = this.state.queue
-          // And clone it's reference to the end of the queue as long as the second item in the queue isn't a radio
-          // This is because we only allow 1 radio in the queue at a time
-          if (this.state.queue[1].platform !== PLATFORM_RADIO) {
-            this.state.queue.push(radio)
-          }
-
-          // End so the finish event is fired, which also removes the first item in the queue essentially skipping.
-          // This also fixes the duration issue that occurred when playing the radio for a long time and then playing a song.
-          // The duration is reset when the dispatcher finishes.
-          this.dispatcherExec(d => d.end())
-        }
-        else {
-          this.updateEmbed()
-        }
+        this.updateEmbed()
       }
     }
 
     return true
   }
 
+  async search (item) {
+    console.log(`Started search for ${item.query}`)
+    const searchResult = (await searchYouTube(encodeURIComponent(item.query)))[0]
+    console.log(`Finished search for ${item.query} - ${searchResult && searchResult.id}`)
+
+    if (searchResult) {
+      item
+        .setYouTubeTitle(searchResult.title)
+        .setThumbnail(searchResult.thumbnail)
+        .setLink(`https://www.youtube.com/watch?v=${searchResult.id}`)
+        .setYouTubeId(searchResult.id)
+        .setDuration(searchResult.duration)
+
+      return item
+    }
+
+    return false
+  }
+
   async searchAndPlay () {
     const item = this.state.queue[0]
 
     if (item.link) {
-      this.play()
+      await this.play()
+      await this.presearchNextItem()
     }
     else {
-      const searchResults = (await scrapeYt.search(item.query)).filter(res => res.type === "video")
-      const searchResult = searchResults[0]
-
+      const searchResult = await this.search(item)
       if (searchResult) {
-        item.setLink(`https://www.youtube.com/watch?v=${searchResult.id}`)
-          .setYouTubeTitle(searchResult.title)
-          .setDuration(searchResult.duration)
-        this.play()
+        await this.play()
+        await this.presearchNextItem()
       }
       else {
+        this.state.textChannel.send(`:x: Failed to find a YouTube video for \`${item.query}\``)
         console.log(`Couldn't find a video for: ${item.query}`)
       }
     }
   }
 
-  async getYTStream (url) {
-    return new Promise((resolve, reject) => {
-      ytdl.getInfo(url)
-        .then(info => {
-          const format = chooseFormat(info.formats, { quality: "highestaudio" })
-          const FFmpegArgs = [
-            "-ss", msToTimestamp(this.state.playTime, { ms: true }),
-            "-i", format.url,
-            ...this.getFFMpegArgs(),
-            "-analyzeduration", "0",
-            "-loglevel", "0",
-            "-f", "s16le",
-            "-ar", "48000",
-            "-ac", "2",
-          ]
-
-          const passThroughStream = new PassThrough({ highWaterMark: 1 << 25 })
-          const transcoder = new FFmpeg({ args: FFmpegArgs })
-          const opus = new Opus.Encoder({
-            rate: 48000,
-            channels: 2,
-            frameSize: 960,
-          })
-
-          const output = transcoder.pipe(passThroughStream)
-          const outputStream = output.pipe(opus)
-
-          outputStream.on("close", () => {
-            transcoder.destroy()
-            opus.destroy()
-          })
-
-          transcoder.once("readable", () => {
-            resolve(outputStream)
-          })
-        })
-        .catch(reject)
-    })
+  async presearchNextItem () {
+    const nextItem = this.state.queue[1]
+    if (nextItem && !nextItem.link) {
+      console.log(`Started presearch`)
+      await this.search(nextItem)
+      console.log("Finished presearch")
+    }
   }
 
   async play (update = "before") {
-    const item = this.state.queue[0]
-    const fetchYTStream = PLATFORMS_REQUIRE_YT_SEARCH.includes(item.platform)
-    let stream
+    if (!this.state.queue.length) {
+      return
+    }
 
-    if (item.startTime) {
-      this.state.playTime = item.startTime * 1000
+    const item = this.state.queue[0]
+
+    // Fixes a song resuming from its paused state if its bass boost status is updated
+    if (update === "after" && this.state.pauser !== "") {
+      this.updateEmbed()
+      return
     }
 
     if (update === "before") {
       this.updateEmbed()
-    }
-
-    if (fetchYTStream) {
-      try {
-        stream = await this.getYTStream(item.link)
-      }
-      catch (err) {
-        this.state.textChannel.send(`Failed to get a YouTube stream for\n${this.getTrackTitle(item)}\n${item.link}`)
-        this.processQueue()
-        return
-      }
-    }
-    else {
-      stream = await this.getMediaStream(item)
     }
 
     if (this.state.playCount === 0) {
@@ -290,103 +269,188 @@ module.exports = class {
       }
     }
 
-    this.state.playCount++
-
-    const dispatcher = this.state.voiceConnection.play(stream, fetchYTStream ? { type: "opus" } : undefined)
-    dispatcher.setVolumeLogarithmic(this.state.volume / 100)
-
-    if (update === "after") {
-      this.updateEmbed()
+    const stream = await this.getMediaStream(item)
+    if (!stream) {
+      return
     }
 
-    dispatcher.on("start", () => {
-      console.log("Stream starting...")
-      this.cleanProgress()
-      if (item.duration > 0) {
-        this.state.progressHandle = setInterval(() => this.updateEmbed(true), 5000)
+    this.stream = stream
+    this.setState({ playCount: this.state.playCount + 1 })
+
+    // Using on readable makes the transition smoother when restarting the stream.
+    // i.e. when changing the bass boost
+    // TODO: Handle the error event
+    stream.once("readable", () => {
+      const dispatcher = this.state.voiceConnection.play(stream, { type: "opus" })
+      dispatcher.setVolumeLogarithmic(this.state.volume / 100)
+
+      dispatcher.on("start", () => {
+        // Fixes a song resuming from its paused state if a TTS message is played
+        if (update === "resume" && this.state.pauser !== "") {
+          this.dispatcherExec(d => d.pause())
+          this.updateEmbed()
+        }
+        else {
+          console.log("Stream starting...")
+          this.cleanProgress()
+
+          if (item.duration > 0) {
+            this.streamTimeCache = 0
+            this.setState({
+              progressHandle: setInterval(() => {
+                this.syncTime()
+                this.setState({ queue: this.state.queue })
+                this.updateEmbed(true)
+              }, 5000),
+            })
+          }
+
+          this.startRadioMetadata(item)
+          this.startListenTracking(item)
+        }
+      })
+
+      // This only fires when a stream finishes or is forcibly ended
+      // Commands like bass boost which just restart the stream will not fire this event
+      // so make sure to clean up properly!
+      dispatcher.on("finish", async () => {
+        console.log("Stream finished...")
+
+        item.setFinished()
+        this.updateEmbed(true)
+        await this.processQueue()
+      })
+
+      // Discord.js doesn't destroy streams that have been passed in
+      // So detect when the opus encoder has been closed and destroy our stream
+      dispatcher.streams.opus.once("close", () => {
+        stream.destroy()
+        console.log("Cleaned up underlying stream")
+
+        this.cleanProgress()
+        this.endRadioMetadata(item)
+        this.endListenTracking(item)
+      })
+
+      dispatcher.on("error", err => {
+        console.log(err)
+      })
+
+      if (update === "after") {
+        this.updateEmbed()
       }
-      this.startRadioMetadata(item)
-    })
-
-    dispatcher.on("finish", () => {
-      console.log("Stream finished...")
-
-      item.setFinished()
-      this.updateEmbed(true)
-      this.cleanProgress()
-      this.stopRadioMetadata(item)
-      this.processQueue()
-    })
-
-    dispatcher.on("error", err => {
-      console.log(err)
     })
   }
 
   async getMediaStream (item) {
-    if (item.platform === PLATFORM_RADIO) {
-      const radio = Object.values(radios).find(r => r.url === item.link)
+    if (PLATFORMS_REQUIRE_YT_SEARCH.includes(item.platform)) {
+      try {
+        return await getStream(item.link, { startTime: item.startTime, filters: this.getAudioFilters() })
+      }
+      catch (err) {
+        this.state.textChannel.send(`:x: Failed to get a YouTube stream for\n${this.getTrackTitle(item)}\n${item.link}\n${err.message}`)
+        await this.processQueue()
+        return
+      }
+    }
+    else if (item.platform === PLATFORM_RADIO) {
+      if (item.radio.metadata && item.radio.metadata.type === "sse") {
+        try {
+          const res = await axios({
+            method: "GET",
+            url: item.link,
+            responseType: "stream",
+          })
 
-      if (radio) {
-        item.setRadio(radio)
+          item.setRequestStream(res)
 
-        if (radio.metadata && radio.metadata.type === "sse") {
-          try {
-            const res = await Axios({
-              method: "GET",
-              url: item.link,
-              responseType: "stream",
-            })
-
-            item.setRequestStream(res)
-
-            return res.data
-          }
-          catch (err) {
-            console.log("Error occured when getting radio stream")
-            console.log(err)
-          }
+          return getFfmpegStream(res.data, { startTime: 0, filters: this.getAudioFilters() })
+        }
+        catch (err) {
+          console.log("Error occured when getting radio stream")
+          console.log(err)
         }
       }
     }
 
-    return item.link
+    return getFfmpegStream(item.link, { startTime: 0, filters: this.getAudioFilters() })
   }
 
-  getFFMpegArgs () {
-    return [
-      "-af",
-      `equalizer=f=40:width_type=h:width=50:g=${this.state.bassBoost},atempo=${this.state.tempo}`,
-    ]
+  syncTime (ms = 0) {
+    const deltaTime = (this.dispatcherExec(d => d.streamTime) || 0) - this.streamTimeCache
+    const item = this.state.queue[0]
+    if (item) {
+      const newStartTime = item.startTime + deltaTime + ms
+      const newListenTime = item.listenTime + deltaTime
+
+      item.setStartTime(newStartTime)
+        .setListenTime(newListenTime)
+
+      // console.log(`Set time to ${newStartTime}, set listen time to ${newListenTime}, delta: ${deltaTime}`)
+    }
+
+    this.streamTimeCache += deltaTime
   }
 
-  processQueue () {
+  startListenTracking (item) {
+    this.endListenTracking(item)
+
+    this.streamTimeCache = 0
+
+    if (item.duration > 0 && item.youTubeId && item.youTubeTitle) {
+      const listenTimeRemaining = (item.duration * 1000 * 0.9) - item.listenTime
+
+      this.listenTimeHandle = setTimeout(() => {
+        console.log(`[LISTEN TRACKING] Tracked: ${item.youTubeTitle}`)
+        item.setTracked(true)
+        this.client.db.saveYouTubeVideo(item.youTubeId, item.youTubeTitle)
+        this.client.db.insertYouTubeHistory(item.youTubeId, item.requestee.id, this.guild.id)
+      }, listenTimeRemaining)
+
+      console.log(`[LISTEN TRACKING] Started tracking for: ${item.youTubeTitle} - ${(listenTimeRemaining / 1000).toFixed(2)}s remaining...`)
+    }
+  }
+
+  endListenTracking (item) {
+    if (this.listenTimeHandle) {
+      clearTimeout(this.listenTimeHandle)
+      this.listenTimeHandle = null
+      this.streamTimeCache = 0
+      console.log(`[LISTEN TRACKING] Ended tracking for: ${item.youTubeTitle}`)
+    }
+  }
+
+  getAudioFilters () {
+    return { gain: this.state.bassBoost, tempo: this.state.tempo }
+  }
+
+  async processQueue () {
     if (this.state.repeat === "all") {
       if (this.state.queue.length > 0) {
         this.state.queue.push(this.state.queue.shift())
+        this.setState({ queue: this.state.queue })
       }
     }
     else if (this.state.repeat === "off") {
       this.state.queue.shift()
+      this.setState({ queue: this.state.queue })
     }
-
-    this.state.playTime = 0
 
     if (this.state.queue.length < 1) {
       this.disconnectSound()
     }
     else {
-      this.searchAndPlay()
+      await this.searchAndPlay()
     }
   }
 
   setRepeat (type) {
-    this.state.repeat = type
+    this.setState({ repeat: type })
     this.updateEmbed()
   }
 
   setVolume (volume, isRadioAdBlock = false) {
-    this.state.volume = volume
+    this.setState({ volume })
     this.dispatcherExec(d => d.setVolumeLogarithmic(volume / 100))
     this.updateEmbed()
 
@@ -438,71 +502,73 @@ module.exports = class {
   cleanProgress () {
     if (this.state.progressHandle) {
       clearInterval(this.state.progressHandle)
-      this.state.progressHandle = null
+      this.setState({ progressHandle: null })
     }
   }
 
   cleanUp () {
     this.debouncer.cancel()
-    this.state.voiceConnection = null
-    this.state.voiceChannel = null
-    this.state.joinState = 0
     this.state.messagePump.clear()
   }
 
   startRadioMetadata (item) {
     // Any commands that just play the stream again ie. bass boost, don't fire the finish event,
     // so we need to make sure it gets cleaned up.
-    this.stopRadioMetadata(item)
+    this.endRadioMetadata(item)
 
     if (item.radio && item.radio.metadata) {
-      const radioMetadata = new RadioMetadata(item.radio.metadata.type, item.radio.metadata.url, item.radio.metadata.type === "sse" ? item.requestStream : item.radio.metadata.summon)
-      const metadata = {
-        instance: radioMetadata,
-      }
+      const instance = new RadioMetadata(item.radio.metadata, item.requestStream)
+      item.setRadioInstance(instance)
 
-      item.setRadioMetadata(metadata)
-
-      radioMetadata.subscribe(info => {
-        metadata.info = info
-
-        this.radioMusicToX(item)
-        this.updateEmbed(true)
-      })
-
-      radioMetadata.subscribe(info => {
+      instance.on("data", async info => {
+        item.setRadioMetadata(info)
+        item.setRadioMusicToX(null)
         this.state.radioAdBlock.toggle(!info.artist && !info.title)
+
+        this.updateEmbed(true)
+        await this.radioMusicToX(item)
       })
     }
   }
 
-  stopRadioMetadata (item) {
-    if (item.radioMetadata && item.radioMetadata.instance) {
-      item.radioMetadata.instance.dispose()
-      item.setRadioMetadata(undefined)
+  endRadioMetadata (item) {
+    if (item.radioInstance) {
+      item.radioInstance.destroy()
+      item.setRadioInstance(null)
+      item.setRadioMetadata(null)
+      item.setRadioMusicToX(null)
       this.state.radioAdBlock.toggle(false)
     }
   }
 
   async radioMusicToX (item) {
-    if (item.radioMetadata && item.radioMetadata.info.artist && item.radioMetadata.info.title) {
+    if (item.radioMetadata && item.radioMetadata.artist && item.radioMetadata.title) {
+      const artist = item.radioMetadata.artist
+      const title = item.radioMetadata.title
+
       const sanitise = str => str
-        .replace(/(?<=\b) ft. (?=\b)/gi, " ")
-        .replace(/(?<=\b) feat. (?=\b)/gi, " ")
-        .replace(/(?<=\b) and (?=\b)/gi, " ")
-        .replace(/(?<=\b) & (?=\b)/g, " ")
+        .replace(/(?<=\b| )ft\.(?=\b| )/gi, " ") // a: Eve ft.Gwen Stefani, t: Let Me Blow Ya Mind
+        .replace(/(?<=\b| ) ft (?=\b| )/gi, " ")
+        .replace(/(?<=\b| ) feat\. (?=\b| )/gi, " ")
+        .replace(/(?<=\b| ) and (?=\b| )/gi, " ")
+        .replace(/(?<=\b| ) & (?=\b| )/g, " ")
+        .replace(/(?<=\b| ) x (?=\b| )/gi, " ") // a: Joel Corry x MNEK, t: Head & Heart
+        .replace(/(?<=\b| ) vs (?=\b| )/gi, " ") // a: Alan Fitzpatrick Vs Patrice Rushen, t: Havent You Heard  Fitzys Half Charged Mix
+        // .replace(/[()[\]]/g, " ") // a: The Plug, t: Fashion (feat. M24 Fivio Foreign)
+        .replace(/'/g, "") // a: Anne Marie KSI Digital Farm Animals, t: Don't Play
+        .replace(/[^A-Za-zÀ-ÖØ-öø-ÿ0-9]/g, " ")
 
       const m2x = new MusicToX({
         platform: PLATFORM_RADIO,
         type: "track",
-        artists: sanitise(item.radioMetadata.info.artist),
-        title: sanitise(item.radioMetadata.info.title),
+        artists: sanitise(artist),
+        title: sanitise(title),
       })
 
       try {
         const res = await m2x.processLink()
-        if (res && item.radioMetadata) {
-          item.radioMetadata.musicToX = res
+        if (res && item.radioMetadata && item.radioMetadata.artist === artist && item.radioMetadata.title === title) {
+          item.setRadioMusicToX(res)
           this.updateEmbed(true)
         }
       }
@@ -511,10 +577,9 @@ module.exports = class {
         console.log(err)
       }
     }
-    else {
-      if (item.radioMetadata) {
-        item.radioMetadata.musicToX = undefined
-      }
+    else if (item.radioMusicToX) {
+      item.setRadioMusicToX(null)
+      this.updateEmbed(true)
     }
   }
 
@@ -535,8 +600,7 @@ module.exports = class {
       return 1
     }
     const durationMs = track.duration * 1000
-    const elapsed = Math.min(this.state.playTime + (this.dispatcherExec(d => d.streamTime) || 0), durationMs)
-    const progressPerc = durationMs === 0 ? 0 : elapsed / durationMs
+    const progressPerc = durationMs === 0 ? 0 : track.startTime / durationMs
 
     return progressPerc
   }
@@ -546,28 +610,30 @@ module.exports = class {
   }
 
   createQueueEmbed (currentlyPlaying, progressPerc) {
-    const queue = this.state.queue.slice(1).map((t, i) => `\`${(i + 1).toString().padStart(2, "0")}\` ${Util.escapeMarkdown(this.getTrackTitle(t))} <@${t.requestee.id}>`.slice(0, 1024))
+    const queue = this.state.queue.slice(1).map((t, i) => `\`${(i + 1).toString().padStart(2, "0")}\` ${escapeMarkdown(this.getTrackTitle(t))} <@${t.requestee.id}>`.slice(0, 1024))
     const top10Items = queue.slice(0, 10)
     const top10 = Util.splitMessage(top10Items, { maxLength: 1024 })
     const remainingCount = this.state.queue.length - 1 - top10Items.length
 
     const platformEmoji = this.getPlatformEmoji(currentlyPlaying.platform)
-    const nowPlayingSource = ![PLATFORM_YOUTUBE, "search"].includes(currentlyPlaying.platform) ? `${platformEmoji ? `${platformEmoji} ` : ""}${Util.escapeMarkdown(safeJoin([currentlyPlaying.artists, currentlyPlaying.title], " - "))}` : ""
-    const nowPlayingYouTube = PLATFORMS_REQUIRE_YT_SEARCH.includes(currentlyPlaying.platform) ? `${this.state.emojis.youtube} [${Util.escapeMarkdown(currentlyPlaying.youTubeTitle)}](${currentlyPlaying.link})` : ""
+    const nowPlayingSource = ![PLATFORM_YOUTUBE, "search"].includes(currentlyPlaying.platform) ? `${platformEmoji ? `${platformEmoji} ` : ""}${escapeMarkdown(safeJoin([currentlyPlaying.artists, currentlyPlaying.title], " - "))}` : ""
+    const nowPlayingYouTube = PLATFORMS_REQUIRE_YT_SEARCH.includes(currentlyPlaying.platform) ? `${this.guild.customEmojis.youtube} ${currentlyPlaying.link ? `[${escapeMarkdown(currentlyPlaying.youTubeTitle)}](${currentlyPlaying.link}) \`▶️ ${this.client.db.getYouTubeVideoPlayCount(currentlyPlaying.youTubeId).count}\`` : "Searching..."}` : ""
 
     const radioMusicToX = this.getRadioMusicToXInfo(currentlyPlaying)
-    const radioNowPlaying = currentlyPlaying.platform === PLATFORM_RADIO && currentlyPlaying.radioMetadata && currentlyPlaying.radioMetadata.info ? Util.escapeMarkdown([currentlyPlaying.radioMetadata.info.artist || "", currentlyPlaying.radioMetadata.info.title || ""].filter(s => s.trim()).join(" - ") + (radioMusicToX ? " " + radioMusicToX : "")) : ""
+    const radioNowPlaying = currentlyPlaying.platform === PLATFORM_RADIO && currentlyPlaying.radioMetadata ? escapeMarkdown([currentlyPlaying.radioMetadata.artist || "", currentlyPlaying.radioMetadata.title || ""].filter(s => s.trim()).join(" - ") + (radioMusicToX ? " " + radioMusicToX : "")) : ""
 
     const nowPlaying = [nowPlayingSource, nowPlayingYouTube, radioNowPlaying].filter(s => s.trim()).join("\n")
     const blocks = Math.round(20 * progressPerc)
 
+    const requesteeMember = this.guild.members.cache.get(currentlyPlaying.requestee.id)
+
     return {
       embed: {
         color: 0x0099ff,
-        title: "Lucille :musical_note:",
+        title: "Lucille 🎵",
         author: {
-          name: currentlyPlaying.requestee.displayName,
-          icon_url: currentlyPlaying.requestee.avatar,
+          name: (requesteeMember || { displayName: currentlyPlaying.requestee.id }).displayName,
+          icon_url: requesteeMember ? requesteeMember.user.displayAvatarURL() : null,
         },
         fields: [
           {
@@ -628,21 +694,21 @@ module.exports = class {
 
   getPlatformEmoji (platform) {
     switch (platform) {
-      case PLATFORM_RADIO:
-        return ":radio:"
-      default:
-        return this.state.emojis[platform]
+    case PLATFORM_RADIO:
+      return ":radio:"
+    default:
+      return this.guild.customEmojis[platform]
     }
   }
 
   getRadioMusicToXInfo (item) {
-    if (item.platform === PLATFORM_RADIO && item.radioMetadata && item.radioMetadata.musicToX) {
-      const musicToX = item.radioMetadata.musicToX
+    if (item.platform === PLATFORM_RADIO && item.radioMusicToX) {
+      const musicToX = item.radioMusicToX
       const splitApple = (musicToX.appleId || "").split("-")
       const radioMusicToX = [
-        musicToX.spotifyId && `[${this.state.emojis.spotify}](https://open.spotify.com/track/${musicToX.spotifyId})`,
-        musicToX.tidalId && `[${this.state.emojis.tidal}](https://tidal.com/browse/track/${musicToX.tidalId})`,
-        musicToX.appleId && `[${this.state.emojis.apple}](https://music.apple.com/gb/track/${splitApple[0]}?i=${splitApple[1]})`,
+        musicToX.spotifyId && `[${this.guild.customEmojis.spotify}](https://open.spotify.com/track/${musicToX.spotifyId})`,
+        musicToX.tidalId && `[${this.guild.customEmojis.tidal}](https://tidal.com/browse/track/${musicToX.tidalId})`,
+        musicToX.appleId && `[${this.guild.customEmojis.apple}](https://music.apple.com/gb/album/${splitApple[0]}?i=${splitApple[1]})`,
       ].filter(s => s).join(" ")
 
       return radioMusicToX
@@ -673,14 +739,14 @@ const amountToBassBoostMap = {
 
 const mapRepeatTypeToEmoji = type => {
   switch (type) {
-    case "off":
-      return "⏭️"
-    case "one":
-      return "🔂"
-    case "all":
-      return "🔁"
-    default:
-      return ""
+  case "off":
+    return "⏭️"
+  case "one":
+    return "🔂"
+  case "all":
+    return "🔁"
+  default:
+    return ""
   }
 }
 

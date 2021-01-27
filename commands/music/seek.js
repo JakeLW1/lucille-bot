@@ -1,5 +1,4 @@
 const { Command } = require("discord.js-commando")
-const { getOrCreateMusic } = require("../../classes/Helpers")
 
 module.exports = class extends Command {
   constructor (client) {
@@ -32,7 +31,11 @@ module.exports = class extends Command {
   }
 
   async run (msg, args) {
-    const music = getOrCreateMusic(msg)
+    const music = msg.guild.music
+    if (!music.state.queue.length) {
+      return
+    }
+
     let position = 0
     const match = args.position.match(/^(\d{1,2}):(\d{1,2})$/)
     if (match) {
@@ -42,7 +45,8 @@ module.exports = class extends Command {
       position = parseInt(args.position)
     }
 
-    music.state.playTime = position * 1000
+    music.state.queue[0].setStartTime(position * 1000)
+    music.setState({ queue: music.state.queue })
     music.play("after")
     msg.react("⏩")
   }

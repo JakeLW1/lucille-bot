@@ -35,8 +35,8 @@ jobs:
           key: ${{ secrets.KEY }}
           port: ${{ secrets.PORT }}
           script: |
-            [ -d "/var/www/lucille-bot" ] && cd /var/www/lucille-bot && git pull && npm install && pm2 reload lucille
-        
+            cd /var/www/lucille-bot && git pull && npm i && git reset --hard && pm2 reload lucille
+
       - name: Post-deploy notification to Lucille
         if: github.repository == 'MikeDev96/lucille-bot'
         uses: fjogeleit/http-request-action@master

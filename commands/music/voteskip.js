@@ -1,5 +1,4 @@
 const { Command } = require("discord.js-commando")
-const { getOrCreateMusic } = require("../../classes/Helpers")
 
 module.exports = class PlayCommand extends Command {
   constructor (client) {
@@ -14,7 +13,7 @@ module.exports = class PlayCommand extends Command {
   }
 
   async run (msg, args) {
-    const music = getOrCreateMusic(msg)
+    const music = msg.guild.music
     const tracks = music.state.queue
 
     if (tracks.length) {
@@ -47,6 +46,7 @@ module.exports = class PlayCommand extends Command {
             msg.react("⏭️")
 
             music.state.queue.splice(1)
+            music.setState({ queue: music.state.queue })
             music.dispatcherExec(d => d.end())
           }
           else {

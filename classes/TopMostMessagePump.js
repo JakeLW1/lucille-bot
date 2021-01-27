@@ -1,10 +1,18 @@
-module.exports = class {
+const { EventEmitter } = require("events")
+
+module.exports = class extends EventEmitter {
   constructor (textChannel) {
+    super()
+
     this.textChannel = textChannel
     this.message = null
     this.messageContents = null
     this.busy = false
     this.shouldClear = false
+  }
+
+  setChannel (textChannel) {
+    this.textChannel = textChannel
   }
 
   async set (message, edit) {
@@ -78,6 +86,7 @@ module.exports = class {
   async sendMessage (messageContents) {
     try {
       this.message = await this.textChannel.send(messageContents)
+      this.emit("create", this.message)
     }
     catch (err) {
       console.log("Failed to send message in TMMP")

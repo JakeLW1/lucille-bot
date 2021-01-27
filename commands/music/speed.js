@@ -1,5 +1,4 @@
 const { Command } = require("discord.js-commando")
-const { getOrCreateMusic } = require("../../classes/Helpers")
 
 module.exports = class extends Command {
   constructor (client) {
@@ -22,9 +21,9 @@ module.exports = class extends Command {
   }
 
   async run (msg, args) {
-    const music = getOrCreateMusic(msg)
-    music.state.playTime += music.dispatcherExec(d => d.streamTime) || 0
-    music.state.tempo = args.speed
+    const music = msg.guild.music
+    music.syncTime()
+    music.setState({ tempo: args.speed })
     music.play("after")
     msg.react(args.speed === 1 ? "🔄" : args.speed > 1 ? "💨" : "🐌")
   }
